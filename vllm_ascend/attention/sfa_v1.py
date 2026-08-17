@@ -20,6 +20,9 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
+from compressed_tensors.compressors.mx_utils import decompress_mx_scale
+from compressed_tensors.quantization.lifecycle.forward import dequantize
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -723,10 +726,48 @@ class AscendSFAImpl(MLAAttentionImpl):
         pass
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-        # NOTE: We currently do not support quant kv_b_proj.
-        assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
-        # NOTE: Weight will be reshaped next, we need to revert and transpose it.
-        kv_b_proj_weight = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, ACL_FORMAT_FRACTAL_ND).T
+        layer_quant_method = self.kv_b_proj.quant_method
+
+        quant_method = getattr(
+            layer_quant_method,
+            "quant_method",
+            layer_quant_method,
+        )
+
+        if isinstance(
+            quant_method,
+            AscendW8A8MXFP8DynamicLinearMethod,
+        ):
+            # Restore the checkpoint layout before dequantization.
+            if getattr(self.kv_b_proj, "_mxfp8_transformed", False):
+                quant_method.restore_weights_for_rl_loading(
+                    self.kv_b_proj
+                )
+            scale = decompress_mx_scale(
+                self.kv_b_proj.weight_scale.data
+            )
+            kv_b_proj_weight = dequantize(
+                x_q=self.kv_b_proj.weight.data,
+                scale=scale,
+                zero_point=None,
+                g_idx=None,
+            ).to(act_dtype)
+
+            # Transpose to the layout expected by the SFA weight reshape below.
+            kv_b_proj_weight = kv_b_proj_weight.T
+
+        else:
+            assert isinstance(
+                layer_quant_method,
+                UnquantizedLinearMethod,
+            )
+
+            # NOTE: Weight will be reshaped next, we need to revert and transpose it.
+            kv_b_proj_weight = torch_npu.npu_format_cast(
+                self.kv_b_proj.weight.data,
+                ACL_FORMAT_FRACTAL_ND,
+            ).T
+
         assert kv_b_proj_weight.shape == (
             self.kv_lora_rank,
             self.local_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
