@@ -55,6 +55,13 @@ class DSparkConfidenceHead(nn.Module):
 
 class AscendQwen3DSparkForCausalLM(Qwen3DSparkForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+
+        # Ensure Ascend compressed-tensors config is registered before
+        # upstream DSpark calls get_draft_quant_config().
+        from vllm_ascend.quantization.compressed_tensors_config import (
+            AscendCompressedTensorsConfig,
+        )
+
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
         config = self.config
