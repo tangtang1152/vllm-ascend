@@ -23,6 +23,138 @@ from vllm.model_executor.models.deepseek_v2 import (
 )
 from vllm.model_executor.models.utils import extract_layer_index
 
+import vllm.model_executor.models.deepseek_v2 as deepseek_v2_module
+from compressed_tensors.compressors.mx_utils import decompress_mx_scale
+from compressed_tensors.quantization.lifecycle.forward import dequantize
+
+_ORIGINAL_TRY_LOAD_FP8_INDEXER_WK = (
+    deepseek_v2_module._try_load_fp8_indexer_wk
+)
+def _ascend_try_load_fp8_indexer_wk(
+    name,
+    tensor,
+    buf,
+    params_dict,
+    loaded_params,
+    pp_missing_layer_names,
+):
+    # Only intercept the DeepSeek/GLM indexer WK path.
+    if "indexer.wk." not in name or "wk_weights" in name:
+        return _ORIGINAL_TRY_LOAD_FP8_INDEXER_WK(
+            name,
+            tensor,
+            buf,
+            params_dict,
+            loaded_params,
+            pp_missing_layer_names,
+        )
+
+    is_weight = (
+        name.endswith(".weight")
+        and tensor.dtype == torch.float8_e4m3fn
+    )
+
+    # compressed-tensors MXFP8:
+    #
+    #   wk.weight       -> float8_e4m3fn
+    #   wk.weight_scale -> uint8 E8M0
+    #
+    # Upstream helper currently handles the weight_scale_inv
+    # FP8 representation, but not this MXFP8 representation.
+    is_mx_scale = (
+        name.endswith(".weight_scale")
+        and tensor.dtype == torch.uint8
+    )
+
+    # Anything unrelated to compressed-tensors MXFP8
+    # continues through the upstream vLLM helper.
+    if not is_weight and not is_mx_scale:
+        return _ORIGINAL_TRY_LOAD_FP8_INDEXER_WK(
+            name,
+            tensor,
+            buf,
+            params_dict,
+            loaded_params,
+            pp_missing_layer_names,
+        )
+
+    layer_prefix = name.rsplit(".wk.", 1)[0]
+    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
+
+    # Pipeline-parallel stages may not own this parameter.
+    if any(
+        fused_name.startswith(missing_prefix)
+        for missing_prefix in pp_missing_layer_names
+    ):
+        return True
+
+    entry = buf.setdefault(layer_prefix, {})
+
+    if is_mx_scale:
+        # New compressed-tensors MXFP8 scale.
+        entry["mx_scale"] = tensor
+
+        # Weight may appear later in the checkpoint stream.
+        if "weight" not in entry:
+            return True
+
+    else:
+        # For wk.weight itself, normally let upstream handle it.
+        #
+        # If mx_scale arrived before weight, however, we now have
+        # the full MXFP8 pair and can finish it here.
+        if "mx_scale" not in entry:
+            return _ORIGINAL_TRY_LOAD_FP8_INDEXER_WK(
+                name,
+                tensor,
+                buf,
+                params_dict,
+                loaded_params,
+                pp_missing_layer_names,
+            )
+
+        entry["weight"] = tensor
+
+    # At this point we have:
+    #
+    # entry["weight"]   : FP8 E4M3
+    # entry["mx_scale"] : uint8 E8M0
+    weight_fp8 = entry["weight"]
+    mx_scale = entry["mx_scale"]
+
+    # uint8 E8M0 exponent -> floating-point scale
+    scale = decompress_mx_scale(mx_scale)
+
+    # compressed-tensors MXFP8 -> BF16
+    weight_bf16 = dequantize(
+        x_q=weight_fp8,
+        scale=scale,
+        zero_point=None,
+        g_idx=None,
+    ).to(torch.bfloat16)
+
+    del buf[layer_prefix]
+
+    # Runtime Indexer uses the fused:
+    #
+    # wk_weights_proj
+    #
+    # shard 0 = wk
+    # shard 1 = weights_proj
+    param = params_dict[fused_name]
+    param.weight_loader(
+        param,
+        weight_bf16,
+        0,
+    )
+
+    loaded_params.add(fused_name)
+    return True
+
+deepseek_v2_module._try_load_fp8_indexer_wk = (
+    _ascend_try_load_fp8_indexer_wk
+)
+
 
 def _should_skip_indexer_init(
     config: DeepseekV2Config | DeepseekV3Config,
