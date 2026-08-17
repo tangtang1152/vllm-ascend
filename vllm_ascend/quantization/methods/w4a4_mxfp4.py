@@ -35,6 +35,15 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
 
+# Future packed-checkpoint friendly helper.
+# Select checkpoint parameter names for packed compressed-tensors weights.
+def _use_packed_mxfp4_weight_names() -> bool:
+    quant_config = get_current_vllm_config().quant_config
+    if quant_config is None:
+        return False
+
+    get_name = getattr(quant_config, "get_name", None)
+    return callable(get_name) and get_name() == "compressed-tensors"
 
 @register_scheme("W4A4_MXFP4", "linear")
 class AscendW4A4MXFP4DynamicLinearMethod(AscendLinearScheme):
@@ -53,7 +62,12 @@ class AscendW4A4MXFP4DynamicLinearMethod(AscendLinearScheme):
         self.group_size = vllm_config.quant_config.quant_description.get("group_size", 32)
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
-        params_dict = {"weight": torch.empty(output_size, input_size // 2, dtype=torch.uint8)}
+        weight_name = (
+            "weight_packed"
+            if _use_packed_mxfp4_weight_names()
+            else "weight"
+        )
+        params_dict = {weight_name: torch.empty(output_size, input_size // 2, dtype=torch.uint8,)}
         return params_dict
 
     def get_pergroup_param(
@@ -109,6 +123,13 @@ class AscendW4A4MXFP4DynamicLinearMethod(AscendLinearScheme):
         - weight_scale: (n_dim, k_dim) -> (k_dim//2, n_dim, 2)
         """
 
+        if hasattr(layer, "weight_packed"):
+            layer.weight = torch.nn.Parameter(
+                layer.weight_packed.data,
+                requires_grad=False,
+            )
+            delattr(layer, "weight_packed")
+
         n_dim, k_dim = layer.weight_scale.data.shape
         layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1)
@@ -139,11 +160,10 @@ class AscendW4A4MXFP4DynamicFusedMoEMethod(AscendMoEScheme):
         num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
         param_dict = {}
-        param_dict["w13_weight"] = torch.empty(
-            num_experts, 2 * intermediate_size_per_partition, hidden_sizes // 2, dtype=torch.uint8
+        suffix = "_packed" if _use_packed_mxfp4_weight_names() else ""
+        param_dict[f"w13_weight{suffix}"] = torch.empty(num_experts, 2 * intermediate_size_per_partition, hidden_sizes // 2, dtype=torch.uint8,
         )
-        param_dict["w2_weight"] = torch.empty(
-            num_experts, hidden_sizes, intermediate_size_per_partition // 2, dtype=torch.uint8
+        param_dict[f"w2_weight{suffix}"] = torch.empty(num_experts, hidden_sizes, intermediate_size_per_partition // 2, dtype=torch.uint8,
         )
         return param_dict
 
@@ -249,6 +269,20 @@ class AscendW4A4MXFP4DynamicFusedMoEMethod(AscendMoEScheme):
         )
 
     def process_weights_after_loading(self, layer):
+        if hasattr(layer, "w13_weight_packed"):
+            layer.w13_weight = torch.nn.Parameter(
+                layer.w13_weight_packed.data,
+                requires_grad=False,
+            )
+            delattr(layer, "w13_weight_packed")
+
+        if hasattr(layer, "w2_weight_packed"):
+            layer.w2_weight = torch.nn.Parameter(
+                layer.w2_weight_packed.data,
+                requires_grad=False,
+            )
+            delattr(layer, "w2_weight_packed")
+
         g_num, n_size, k_size = layer.w13_weight_scale.shape
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
         g_num, n_size, k_size = layer.w2_weight_scale.shape
