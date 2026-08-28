@@ -43,6 +43,13 @@ def is_fused_moe_layer(layer: torch.nn.Module) -> bool:
     return isinstance(layer, (MoERunner, RoutedExperts))
 
 
+# MX scale algorithm is derived from model configuration but consumed
+# in runtime paths where get_current_vllm_config() may no longer be
+# available. Cache the value once it is resolved during model/quant
+# scheme construction.
+_DYNAMIC_MX_QUANT_SCALE_ALG: int | None = None
+
+
 def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
     """Select the MX scale algorithm used by DynamicMxQuantV3.
 
@@ -50,10 +57,24 @@ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
     maximum absolute value. ``scale_alg=1`` first maps that maximum to the
     destination FP8 range, then rounds the E8M0 scale exponent up to avoid
     quantization overflow. MiniMax M3 checkpoints require the latter.
+
+    The selected algorithm is model-level state. Runtime MX quantization
+    can execute outside the ``set_current_vllm_config`` context, so cache
+    the value whenever an explicit config is available and reuse it during
+    forward execution.
     """
+    global _DYNAMIC_MX_QUANT_SCALE_ALG
+
     if not get_current_hardware_profile().supports(HardwareCapability.DYNAMIC_MX_QUANT_SCALE_ALG_ONE):
         return 0
 
+    # Runtime callers such as A5DeviceAdaptor.npu_dynamic_quant() do not
+    # necessarily execute inside vLLM's current-config context.
+    if vllm_config is None and _DYNAMIC_MX_QUANT_SCALE_ALG is not None:
+        return _DYNAMIC_MX_QUANT_SCALE_ALG
+
+    # Keep the original fallback for callers that run inside a valid
+    # construction/configuration context before the cache is initialized.
     if vllm_config is None:
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
@@ -70,15 +91,24 @@ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
     architectures = getattr(model_config, "architectures", None) or ()
     if isinstance(architectures, str):
         architectures = (architectures,)
+
     hf_text_config = getattr(model_config, "hf_text_config", None)
     model_type = getattr(hf_text_config, "model_type", None)
+
     if (
-        any(isinstance(architecture, str) and architecture.startswith("MiniMaxM3") for architecture in architectures)
+        any(
+            isinstance(architecture, str)
+            and architecture.startswith("MiniMaxM3")
+            for architecture in architectures
+        )
         or model_type == "minimax_m3"
     ):
-        return 1
-    return 0
+        scale_alg = 1
+    else:
+        scale_alg = 0
 
+    _DYNAMIC_MX_QUANT_SCALE_ALG = scale_alg
+    return scale_alg
 
 def get_model_file(
     model: str | Path,
