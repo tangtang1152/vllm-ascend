@@ -54,6 +54,36 @@ _remove_quantization_method()
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, dict[str, "QuantizationArgs"] | None]
 
 
+# DeepSeek-V4 uses different names in the Ascend runtime model and
+# HuggingFace/LLMC canonical model.  Keep the actual Ascend Module names
+# unchanged and use this mapping only as a fallback for quantization target
+# matching.
+def _dsv4_ascend_to_hf_layer_name(layer_name: str) -> str:
+    mappings = (
+        (".self_attn.wq_a", ".self_attn.q_a_proj"),
+        (".self_attn.wq_b", ".self_attn.q_b_proj"),
+        (".self_attn.wkv", ".self_attn.kv_proj"),
+        (".self_attn.wo_a", ".self_attn.o_a_proj"),
+        (".self_attn.wo_b", ".self_attn.o_b_proj"),
+
+        # DSV4 Indexer:
+        # Ascend keeps Indexer as self_attn.indexer, while HF/LLMC
+        # serializes it under self_attn.compressor.indexer.
+        #
+        # q_b_proj is explicitly quantized by the LLMC recipe, so
+        # construction-time target matching needs this reverse alias.
+        (
+            ".self_attn.indexer.wq_b",
+            ".self_attn.compressor.indexer.q_b_proj",
+        ),
+    )
+
+    for ascend_name, hf_name in mappings:
+        layer_name = layer_name.replace(ascend_name, hf_name)
+
+    return layer_name
+
+
 @register_quantization_config(COMPRESSED_TENSORS_METHOD)
 class AscendCompressedTensorsConfig(QuantizationConfig):
     """Config class for LLM-Compressor (compressed_tensors) quantization on Ascend.
@@ -143,10 +173,19 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
                     if format is not None
                     else is_activation_quantization_format(quant_format)
                 )
+
+                # CompressionFormat.mixed_precision.value == "mixed_precision"
+                mixed_precision_format = (
+                    quant_format in ("mixed-precision","mixed_precision")
+                )
+
                 input_activations = quant_config.get("input_activations")
-                if act_quant_format and input_activations is not None:
-                    target_scheme_map[target]["input_activations"] = QuantizationArgs.model_validate(
-                        quant_config.get("input_activations")
+                if (
+                    (act_quant_format or mixed_precision_format)
+                    and input_activations is not None
+                ):
+                    target_scheme_map[target]["input_activations"] = (
+                        QuantizationArgs.model_validate(input_activations)
                     )
         return target_scheme_map
 
@@ -293,6 +332,28 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
                 targets=self.target_scheme_map.keys(),
                 fused_mapping=self.packed_modules_mapping,
             )
+
+            # DSV4 HF canonical target fallback:
+            #
+            # Ascend constructs modules with names such as:
+            #   self_attn.wkv
+            #
+            # while LLMC/compressed-tensors records targets using the
+            # HuggingFace canonical namespace:
+            #   self_attn.kv_proj
+            #
+            # Preserve native Ascend-name matching first.  Only when that
+            # fails do we retry using the HF canonical alias.
+            if matched_target is None:
+                hf_layer_name = _dsv4_ascend_to_hf_layer_name(layer_name)
+
+                if hf_layer_name != layer_name:
+                    matched_target = find_matched_target(
+                        layer_name=hf_layer_name,
+                        module=layer,
+                        targets=self.target_scheme_map.keys(),
+                        fused_mapping=self.packed_modules_mapping,
+                    )
             if matched_target is None:
                 return None
             scheme_dict = self.target_scheme_map[matched_target]
@@ -357,6 +418,31 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
         format = format if format is not None else self.quant_format
         act_quant_format = is_activation_quantization_format(format)
 
+        # MXFP8: static FP8 group-wise weights + dynamic FP8 group-wise activations.
+        if (format == "mxfp8-quantized"
+            and self._is_dynamic_group_mx(
+                weight_quant=weight_quant,
+                input_quant=input_quant,
+                num_bits=8,
+            )
+        ):
+            assert self.quant_description is not None
+            self.quant_description["group_size"] = weight_quant.group_size or 32
+            return "W8A8_MXFP8"
+
+
+        # MXFP4: static packed FP4 group-wise weights + dynamic FP4 group-wise activations.
+        if (format == "mxfp4-pack-quantized"
+            and self._is_dynamic_group_mx(
+                weight_quant=weight_quant,
+                input_quant=input_quant,
+                num_bits=4,
+            )
+        ):
+            assert self.quant_description is not None
+            self.quant_description["group_size"] = weight_quant.group_size or 32
+            return "W4A4_MXFP4"
+
         if act_quant_format and input_quant is not None:
             if self._is_static_tensor_w8a8(weight_quant, input_quant):
                 return "W8A8"
@@ -374,6 +460,19 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
             return "W4A16"
 
         raise NotImplementedError("No compressed-tensors compatible quantization type was found.")
+
+    def _is_dynamic_group_mx(self, weight_quant: "QuantizationArgs", input_quant: Optional["QuantizationArgs"], num_bits: int) -> bool:
+        """Detect MXFP group-wise weight and dynamic activation quantization."""
+        if input_quant is None: return False
+
+        is_float = weight_quant.type == input_quant.type == QuantizationType.FLOAT
+        is_expected_bits = weight_quant.num_bits == input_quant.num_bits == num_bits
+        is_group = weight_quant.strategy == QuantizationStrategy.GROUP.value and input_quant.strategy == QuantizationStrategy.GROUP.value
+        is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+        is_symmetric = weight_quant.symmetric and input_quant.symmetric
+        is_group_size_32 = weight_quant.group_size == input_quant.group_size == 32
+
+        return is_float and is_expected_bits and is_group and is_dynamic and is_symmetric and is_group_size_32
 
     def _is_static_tensor_w8a8(self, weight_quant: "QuantizationArgs", input_quant: "QuantizationArgs") -> bool:
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8

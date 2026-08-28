@@ -1099,6 +1099,111 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
             if ".attn_norm." in name:
                 name = name.replace(".attn_norm.", ".input_layernorm.")
+            # LLMC / HuggingFace DeepSeek-V4 checkpoints use the
+            # canonical Hyper-Connection submodule namespace, while
+            # vLLM-Ascend keeps these HC parameters flat.
+            #
+            # Run this mapping unconditionally so .fn / .base / .scale
+            # are all handled before generic quantization scale mapping.
+            name = name.replace(".attn_hc.fn", ".hc_attn_fn")
+            name = name.replace(".attn_hc.base", ".hc_attn_base")
+            name = name.replace(".attn_hc.scale", ".hc_attn_scale")
+
+            name = name.replace(".ffn_hc.fn", ".hc_ffn_fn")
+            name = name.replace(".ffn_hc.base", ".hc_ffn_base")
+            name = name.replace(".ffn_hc.scale", ".hc_ffn_scale")
+
+            # HF final HyperHead namespace, if present.
+            name = name.replace(".hc_head.hc_fn", ".hc_head_fn")
+            name = name.replace(".hc_head.hc_base", ".hc_head_base")
+            name = name.replace(".hc_head.hc_scale", ".hc_head_scale")
+
+            # Generic compressed-tensors scale mapping.
+            # HC .scale has already become _scale above, so it is not affected.
+            # DSV4 HF canonical attention projections
+            #
+            # LLMC/HuggingFace saves these tensors using canonical names,
+            # while the Ascend runtime model keeps DeepSeek-style internal
+            # names.  Translate the checkpoint key before params_dict lookup.
+            for hf_name, ascend_name in (
+                (".self_attn.q_a_proj.", ".self_attn.wq_a."),
+                (".self_attn.q_b_proj.", ".self_attn.wq_b."),
+                (".self_attn.kv_proj.", ".self_attn.wkv."),
+                (".self_attn.o_a_proj.", ".self_attn.wo_a."),
+                (".self_attn.o_b_proj.", ".self_attn.wo_b."),
+                (".self_attn.q_a_norm.", ".self_attn.q_norm."),
+                (".self_attn.sinks", ".self_attn.attn_sink"),
+
+                # HF canonical Compressor namespace -> Ascend DSV4 runtime.
+                #
+                # Keep this before stacked_params_mapping.  In particular,
+                # compressor.gate_proj must become compressor.wgate first,
+                # otherwise the generic MLP mapping
+                #
+                #   gate_proj -> gate_up_proj
+                #
+                # will incorrectly rewrite the compressor parameter.
+                (
+                    ".self_attn.compressor.gate_proj.",
+                    ".self_attn.compressor.wgate.",
+                ),
+                (
+                    ".self_attn.compressor.kv_proj.",
+                    ".self_attn.compressor.wkv.",
+                ),
+                (
+                    ".self_attn.compressor.kv_norm.",
+                    ".self_attn.compressor.norm.",
+                ),
+                (
+                    ".self_attn.compressor.position_bias",
+                    ".self_attn.compressor.ape",
+                ),
+
+                # HF canonical Indexer namespace -> Ascend DSV4 runtime.
+                #
+                # HF nests the Indexer under:
+                #
+                #   self_attn.compressor.indexer
+                #
+                # while Ascend keeps it directly under:
+                #
+                #   self_attn.indexer
+                #
+                # The Indexer's own KV/gate compressor is another nested
+                # Compressor in the Ascend runtime.
+                (
+                    ".self_attn.compressor.indexer.gate_proj.",
+                    ".self_attn.indexer.compressor.wgate.",
+                ),
+                (
+                    ".self_attn.compressor.indexer.kv_proj.",
+                    ".self_attn.indexer.compressor.wkv.",
+                ),
+                (
+                    ".self_attn.compressor.indexer.kv_norm.",
+                    ".self_attn.indexer.compressor.norm.",
+                ),
+                (
+                    ".self_attn.compressor.indexer.position_bias",
+                    ".self_attn.indexer.compressor.ape",
+                ),
+
+                # This one is MXFP8 in the LLMC checkpoint.
+                (
+                    ".self_attn.compressor.indexer.q_b_proj.",
+                    ".self_attn.indexer.wq_b.",
+                ),
+
+                # HF has an extra scorer namespace; Ascend stores
+                # weights_proj directly on the Indexer.
+                (
+                    ".self_attn.compressor.indexer.scorer.weights_proj.",
+                    ".self_attn.indexer.weights_proj.",
+                ),
+            ):
+                name = name.replace(hf_name, ascend_name)
+
             if name.endswith(".scale"):
                 name = name.replace(".scale", ".weight_scale")
 
