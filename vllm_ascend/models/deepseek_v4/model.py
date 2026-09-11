@@ -1390,6 +1390,19 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                         if name is None:
                             continue
 
+                        # Transformers >= 5.15 may serialize the DeepSeek-V4
+                        # attention-level `kv_norm` as `attn.norm`.
+                        # Keep the normal path when the checkpoint name already
+                        # matches a runtime parameter, and only fall back to
+                        # `self_attn.kv_norm` when necessary.
+                        if name not in params_dict and ".self_attn.norm." in name:
+                            compat_name = name.replace(
+                                ".self_attn.norm.",
+                                ".self_attn.kv_norm.",
+                            )
+                            if compat_name in params_dict:
+                                name = compat_name
+
                         if is_pp_missing_parameter(name, self):
                             continue
 
