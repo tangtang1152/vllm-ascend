@@ -1760,6 +1760,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                 o = torch.bmm(o.transpose(0, 1), self._get_batched_wo_a_weight(o_proj_groups)).transpose(0, 1)
             else:
                 o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
+                wo_a_scale = self._get_batched_wo_a_scale(o_proj_groups).contiguous()
                 o = torch_npu.npu_transpose_quant_batchmatmul(
                     o,
                     self._get_batched_wo_a_weight(o_proj_groups),
@@ -1767,7 +1768,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                     bias=None,
                     group_sizes=(0, 0, 32),
                     x1_scale=swiglu_out_scale.view(torch.float8_e8m0fnu),
-                    x2_scale=self._get_batched_wo_a_scale(o_proj_groups).view(torch.float8_e8m0fnu),
+                    x2_scale=wo_a_scale.view(torch.float8_e8m0fnu),
                     perm_x1=(1, 0, 2),
                     perm_x2=(0, 1, 2),
                     perm_y=(1, 0, 2),
