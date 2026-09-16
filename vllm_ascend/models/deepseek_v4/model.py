@@ -1158,6 +1158,12 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
+        hc_head_name_mappings = {
+            "model.hc_head.hc_fn": "model.hc_head_fn",
+            "model.hc_head.hc_base": "model.hc_head_base",
+            "model.hc_head.hc_scale": "model.hc_head_scale",
+        }
+
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
 
@@ -1195,6 +1201,20 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
             if ".attn_norm." in name:
                 name = name.replace(".attn_norm.", ".input_layernorm.")
+
+            if name not in params_dict:
+                mapped_name = hc_head_name_mappings.get(name)
+                if mapped_name in params_dict:
+                    name = mapped_name
+
+            if name not in params_dict and ".self_attn.norm." in name:
+                mapped_name = name.replace(
+                    ".self_attn.norm.",
+                    ".self_attn.kv_norm.",
+                )
+                if mapped_name in params_dict:
+                    name = mapped_name
+
             if name.endswith(".scale"):
                 name = name.replace(".scale", ".weight_scale")
 
