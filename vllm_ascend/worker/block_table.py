@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
@@ -168,30 +169,92 @@ class BlockTable:
             )
             self._compute_dcp_slot_mapping(req_indices, positions)
         else:
-            TILE_BLOCK_SIZE = 1024
-            kernel_kwargs = {
-                "KV_CACHE_BLOCK_SIZE": self.physical_block_size,
-                "BLOCKS_PER_KV_BLOCK": self.blocks_per_phys_block,
-                "TOTAL_CP_WORLD_SIZE": total_cp_world_size,
-                "TOTAL_CP_RANK": total_cp_rank,
-                "CP_KV_CACHE_INTERLEAVE_SIZE": self.cp_kv_cache_interleave_size,
-                "PAD_ID": PAD_SLOT_ID,
-                "TILE_BLOCK_SIZE": TILE_BLOCK_SIZE,
-                "BLOCK_TABLE_WINDOW_SIZE": _next_power_of_2(cdiv(TILE_BLOCK_SIZE, self.block_size) + 1),
-                "IS_CIRCULAR": self.is_circular,
-            }
+            if HAS_TRITON:
+                TILE_BLOCK_SIZE = 1024
+                kernel_kwargs = {
+                    "KV_CACHE_BLOCK_SIZE": self.physical_block_size,
+                    "BLOCKS_PER_KV_BLOCK": self.blocks_per_phys_block,
+                    "TOTAL_CP_WORLD_SIZE": total_cp_world_size,
+                    "TOTAL_CP_RANK": total_cp_rank,
+                    "CP_KV_CACHE_INTERLEAVE_SIZE": self.cp_kv_cache_interleave_size,
+                    "PAD_ID": PAD_SLOT_ID,
+                    "TILE_BLOCK_SIZE": TILE_BLOCK_SIZE,
+                    "BLOCK_TABLE_WINDOW_SIZE": _next_power_of_2(cdiv(TILE_BLOCK_SIZE, self.block_size) + 1),
+                    "IS_CIRCULAR": self.is_circular,
+                }
 
-            _compute_slot_mapping_kernel[(num_reqs + 1,)](
-                num_tokens,
-                self.max_num_batched_tokens,
-                query_start_loc,
+                _compute_slot_mapping_kernel[(num_reqs + 1,)](
+                    num_tokens,
+                    self.max_num_batched_tokens,
+                    query_start_loc,
+                    positions,
+                    self.block_table.gpu,
+                    self.block_table.gpu.stride(0),
+                    self.block_size,
+                    self.slot_mapping.gpu,
+                    **kernel_kwargs,
+                )
+            else:
+                self._compute_slot_mapping_torch(
+                    num_reqs,
+                    query_start_loc,
+                    positions,
+                )
+
+    def _compute_slot_mapping_torch(
+        self,
+        num_reqs: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Torch fallback for slot mapping when Triton is unavailable."""
+        num_tokens = positions.shape[0]
+        slot_mapping = self.slot_mapping.gpu
+
+        slot_mapping[num_tokens : self.max_num_batched_tokens].fill_(PAD_SLOT_ID)
+
+        if num_tokens == 0:
+            return
+
+        req_indices = torch.repeat_interleave(
+            torch.arange(
+                num_reqs,
+                dtype=torch.int32,
+                device=query_start_loc.device,
+            ),
+            query_start_loc[1:] - query_start_loc[:-1],
+            output_size=num_tokens,
+        )
+
+        if self.is_circular:
+            block_indices = torch.zeros_like(positions)
+        else:
+            block_indices = torch.div(
                 positions,
-                self.block_table.gpu,
-                self.block_table.gpu.stride(0),
                 self.block_size,
-                self.slot_mapping.gpu,
-                **kernel_kwargs,
+                rounding_mode="floor",
             )
+
+        block_table_indices = (
+            req_indices.to(torch.int64) * self.block_table.gpu.stride(0)
+            + block_indices.to(torch.int64)
+        )
+        block_numbers = self.block_table.gpu.flatten()[block_table_indices]
+
+        block_offsets = torch.remainder(positions, self.block_size)
+        slot_ids = (
+            block_numbers.to(block_offsets.dtype) * self.block_size
+            + block_offsets
+        )
+
+        if self.is_circular:
+            slot_ids = torch.where(
+                positions >= 0,
+                slot_ids,
+                PAD_SLOT_ID,
+            )
+
+        slot_mapping[:num_tokens].copy_(slot_ids.to(slot_mapping.dtype))
 
     def compute_slot_mapping_draft(
         self,
